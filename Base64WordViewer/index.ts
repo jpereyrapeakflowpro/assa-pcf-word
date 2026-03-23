@@ -21,6 +21,7 @@ export class Base64WordViewer implements ComponentFramework.StandardControl<IInp
     // Blob for download
     private _blobUrl: string = "";
     private _zoomLevel: number = 100;
+    private _loadId: number = 0; // race condition guard for async conversion
 
     // DOM
     private _mainContainer: HTMLDivElement;
@@ -73,6 +74,7 @@ export class Base64WordViewer implements ComponentFramework.StandardControl<IInp
     }
 
     public destroy(): void {
+        this._loadId++; // cancel any pending async conversions
         this._revokeBlob();
     }
 
@@ -172,12 +174,12 @@ export class Base64WordViewer implements ComponentFramework.StandardControl<IInp
 
     private _loadWord(base64: string): void {
         try {
-            // Clean base64
+            // Clean base64 - handle data URI prefix and whitespace
             let cleanBase64 = base64.trim();
             if (cleanBase64.includes(",")) {
                 cleanBase64 = cleanBase64.split(",")[1];
             }
-            cleanBase64 = cleanBase64.replace(/\s/g, "");
+            cleanBase64 = cleanBase64.replace(/[\s\r\n]/g, "");
 
             // Decode to binary
             const binaryString = atob(cleanBase64);
@@ -186,17 +188,29 @@ export class Base64WordViewer implements ComponentFramework.StandardControl<IInp
                 bytes[i] = binaryString.charCodeAt(i);
             }
 
+            // Create a clean ArrayBuffer copy (avoids shared buffer issues)
+            const arrayBuffer = bytes.buffer.slice(
+                bytes.byteOffset,
+                bytes.byteOffset + bytes.byteLength
+            );
+
             // Create blob for download
             this._revokeBlob();
-            const blob = new Blob([bytes], {
+            const blob = new Blob([arrayBuffer], {
                 type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             });
             this._blobUrl = URL.createObjectURL(blob);
 
-            // Convert DOCX to HTML with mammoth
+            // Show loading state
+            this._showLoading();
+
+            // Guard against race conditions with concurrent loads
+            const currentLoadId = ++this._loadId;
+
+            // Convert DOCX to HTML with mammoth using built-in dataUri for images
             mammoth
                 .convertToHtml(
-                    { arrayBuffer: bytes.buffer },
+                    { arrayBuffer: arrayBuffer },
                     {
                         styleMap: [
                             "p[style-name='Title'] => h1.doc-title",
@@ -205,24 +219,22 @@ export class Base64WordViewer implements ComponentFramework.StandardControl<IInp
                             "p[style-name='Heading 3'] => h3",
                             "p[style-name='Heading 4'] => h4",
                         ],
-                        convertImage: mammoth.images.imgElement(function (image: any) {
-                            return image.read("base64").then(function (imageBuffer: string) {
-                                return {
-                                    src: "data:" + image.contentType + ";base64," + imageBuffer,
-                                };
-                            });
-                        }),
+                        convertImage: mammoth.images.dataUri,
                     }
                 )
                 .then((result: any) => {
+                    // Ignore if a newer load has started
+                    if (currentLoadId !== this._loadId) return;
+
                     this._renderDocument(result.value);
 
-                    // Log any conversion warnings/messages
                     if (result.messages && result.messages.length > 0) {
                         console.warn("Mammoth conversion messages:", result.messages);
                     }
                 })
                 .catch((error: any) => {
+                    if (currentLoadId !== this._loadId) return;
+
                     console.error("Word conversion error:", error);
                     this._showError(
                         `Error al convertir el documento Word: ${error.message || "formato inválido"}`
@@ -334,6 +346,19 @@ export class Base64WordViewer implements ComponentFramework.StandardControl<IInp
     }
 
     // ========== UI STATES ==========
+
+    private _showLoading(): void {
+        this._documentContainer.innerHTML = "";
+        this._viewerWrapper.style.background = "#e8e8e8";
+
+        const loading = document.createElement("div");
+        loading.className = "word-loading-state";
+        loading.innerHTML = `
+            <div class="word-loading-spinner"></div>
+            <div class="word-loading-text">Convirtiendo documento Word...</div>
+        `;
+        this._documentContainer.appendChild(loading);
+    }
 
     private _showEmptyState(): void {
         this._documentContainer.innerHTML = "";
